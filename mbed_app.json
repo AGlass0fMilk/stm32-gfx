@@ -1,0 +1,9 @@
+{
+    "target_overrides": {
+        "*": {
+	    "mbed-lvgl.horizontal_res": 480,
+	    "mbed-lvgl.vertical_res": 320,
+	    "mbed-lvgl.display_dpi": 100
+        }
+    }
+}
