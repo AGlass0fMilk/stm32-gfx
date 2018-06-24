@@ -28,11 +28,20 @@
 #include "mbed_retarget.h"
 #include "mbed_wait_api.h"
 #include "drivers/DigitalOut.h"
+#include "drivers/Ticker.h"
 #include "stm32f4xx_hal.h"
 #include <stdint.h>
 #include "drivers/Serial.h"
+#include "drivers/AnalogIn.h"
 #include "rtos/Thread.h"
 
+extern "C" {
+
+#include "lvgl.h"
+#include "lv_tutorial_themes.h"
+#include "demo.h"
+#include "tpcal.h"
+}
 /* USER CODE BEGIN Includes */
 
 /* USER CODE END Includes */
@@ -53,7 +62,9 @@ void _Error_Handler(char *file, int line);
 
 #define CMD 0
 #define DATA (1 << 16)
-#define SRAM_BANK_ADDR(d) *((__IO uint8_t*)(0x60000000 + d))
+#define SRAM_BANK_ADDR_8BIT(d) *((__IO uint8_t*)(0x60000000 + d))
+#define SRAM_BANK_ADDR_16BIT(d) *((__IO uint16_t*)(0x60000000 + d))
+#define SRAM_BANK_ADDR_32BIT(d) *((__IO uint32_t*)(0x60000000 + d))
 
 i8080_8bit_t bus;
 
@@ -61,6 +72,12 @@ i8080_8bit_t bus;
 //{
 
 //}
+
+mbed::DigitalOut led(LED1);
+mbed::DigitalOut reset(PD_12);
+mbed::DigitalOut chip_select(PB_3, 1);
+
+rtos::Thread led_thread;
 
 /*Sets horizontal filling range*/
 void Set_Column(unsigned long SC, unsigned long EC)
@@ -80,25 +97,170 @@ void TFT_Fill_Screen(uint16_t rgb)
 {
     unsigned long pixel=0;
 
-    Set_Column(0,10);
-    Set_Row(0,10);
+    Set_Column(0,319);
+    Set_Row(0,479);
 
     //Start Write Command
     //hx8357d_write_memory_start(&bus);
 
     *((__IO uint8_t*)(0x60000000)) = 0x2C;
 
-    for(pixel=0;pixel<50;pixel++)
+    for(pixel=0;pixel<(320*480);pixel++)
     {
-   	 *((__IO uint8_t*)(0x60010000)) = (rgb & 0xFF00) >> 8;
-   	 *((__IO uint8_t*)(0x60010000)) = (rgb & 0x00FF);
+    	*((__IO uint16_t*)(0x60010000)) = rgb;
+   	 //*((__IO uint8_t*)(0x60010000)) = (rgb & 0xFF00) >> 8;
+   	 //*((__IO uint8_t*)(0x60010000)) = (rgb & 0x00FF);
     }
 }
 
-mbed::DigitalOut led(LED1);
-mbed::DigitalOut reset(PD_12);
+void TFT_Fillbox(uint16_t x1, uint16_t y1, uint16_t w, uint16_t h, uint16_t color)
+{
+    Set_Column(x1, x1+w-1);
+    Set_Row(y1, y1+h-1);
 
-rtos::Thread led_thread;
+    *((__IO uint8_t*)(0x60000000)) = 0x2C;
+
+    for(int i = 0; i < (w*h); i++)
+    {
+    	*((__IO uint16_t*)(0x60010000)) = color;
+    }
+}
+
+/* Flush the content of the internal buffer the specific area on the display
+ * You can use DMA or any hardware acceleration to do this operation in the background but
+ * 'lv_flush_ready()' has to be called when finished
+ * This function is required only when LV_VDB_SIZE != 0 in lv_conf.h*/
+static void disp_flush(int32_t x1, int32_t y1, int32_t x2, int32_t y2, const lv_color_t * color_p)
+{
+    /*The most simple case (but also the slowest) to put all pixels to the screen one-by-one*/
+
+	Set_Column(x1, x2);
+	Set_Row(y1, y2);
+
+    *((__IO uint8_t*)(0x60000000)) = 0x2C;
+
+    int32_t x;
+    int32_t y;
+    uint16_t* ptr = (uint16_t*) color_p;
+    uint16_t color_565;
+    for(y = y1; y <= y2; y++) {
+        for(x = x1; x <= x2; x++) {
+
+        	uint8_t pix_color = 0;
+        	pix_color = (color_p->red << 3) | ((color_p->green & 0x38) >> 3);
+        	*((__IO uint8_t*)(0x60010000)) = pix_color;
+        	pix_color = ((color_p->green & 0x7) << 5) | (color_p->blue);
+        	*((__IO uint8_t*)(0x60010000)) = pix_color;
+
+        	/*uint32_t pixelColor = 0xFF000000 |
+        			color_p->red << 16 |
+					color_p->green << 8 |
+					color_p->blue;*/
+
+        	/*color_565 |= ((color_p->red & 0x1F) << 11);
+        	color_565 |= ((color_p->green & 0x3F) << 5);
+        	color_565 |= ((color_p->blue & 0x1F));
+        	*((__IO uint16_t*)(0x60010000)) = color_565; //(uint16_t)(color_p->full);*/
+        	color_p = (const lv_color_t*) ++ptr;
+        	//wait_ms(250);
+        }
+    }
+
+    /* IMPORTANT!!!
+     * Inform the graphics library that you are ready with the flushing*/
+    lv_flush_ready();
+}
+
+/* Read the touchpad and store it in 'data'
+ * Return false if no more data read; true for ready again */
+
+#define X_PLUS_PIN 	PC_1
+#define Y_PLUS_PIN 	PC_2
+#define X_MINUS_PIN	PC_4
+#define Y_MINUS_PIN	PC_5
+#define PWM_BACKLITE PC_6
+
+#define NUMSAMPLES 2
+
+static void insert_sort(int array[], uint8_t size) {
+  uint8_t j;
+  int save;
+
+  for (int i = 1; i < size; i++) {
+    save = array[i];
+    for (j = i; j >= 1 && save < array[j - 1]; j--)
+      array[j] = array[j - 1];
+    array[j] = save;
+  }
+}
+
+static bool tp_read(lv_indev_data_t *data)
+{
+	lv_coord_t tp_x, tp_y;
+
+	bool valid;
+	int x, y;
+	int samples[NUMSAMPLES];
+
+	// Read X
+
+	mbed::DigitalOut x_plus_out(X_PLUS_PIN, 1);
+	mbed::DigitalOut x_minus_out(X_MINUS_PIN, 0);
+	mbed::AnalogIn y_plus_in(Y_PLUS_PIN);
+	mbed::AnalogIn y_minux_in(Y_MINUS_PIN);
+	wait_us(20);
+
+	for(int i = 0; i < NUMSAMPLES; i++)
+	{
+		samples[i] = y_plus_in.read_u16();
+	}
+
+   // Allow small amount of measurement noise, because capacitive
+	// coupling to a TFT display's signals can induce some noise.
+	if (samples[0] - samples[1] < -4 || samples[0] - samples[1] > 4) {
+		valid = 0;
+	} else {
+		samples[1] = (samples[0] + samples[1]) >> 1; // average 2 samples
+	}
+
+	//insert_sort(samples, NUMSAMPLES);
+
+	x = (0x4096 - samples[NUMSAMPLES/2]);
+
+	// Read Y
+	mbed::AnalogIn x_plus_in(X_PLUS_PIN);
+	mbed::AnalogIn x_minus_in(X_MINUS_PIN);
+	mbed::DigitalOut y_plus_out(Y_PLUS_PIN, 1);
+	mbed::DigitalOut y_minus_out(Y_MINUS_PIN, 0);
+	wait_us(20);
+
+	for(int i = 0; i < NUMSAMPLES; i++)
+	{
+		samples[i] = x_minus_in.read_u16();
+	}
+
+	//insert_sort(samples, NUMSAMPLES);
+	// Allow small amount of measurement noise, because capacitive
+	// coupling to a TFT display's signals can induce some noise.
+	if (samples[0] - samples[1] < -4 || samples[0] - samples[1] > 4) {
+		valid = 0;
+	} else {
+		samples[1] = (samples[0] + samples[1]) >> 1; // average 2 samples
+	}
+
+	y = (4096 - samples[NUMSAMPLES/2]);
+
+	debug("Touch [%i, %i]\n", x, y);
+	wait_ms(300);
+
+    /* Read your touchpad */
+    data->state = LV_INDEV_STATE_PR; //or LV_INDEV_STATE_PR;
+    data->point.x = (lv_coord_t) x;
+    data->point.y = (lv_coord_t) y;
+
+    return false;   /*false: no more data to read because we are no buffering*/
+}
+
 
 void led_main(void)
 {
@@ -106,6 +268,7 @@ void led_main(void)
 	{
 		led = !led;
 		wait_ms(500);
+
 	}
 }
 
@@ -121,16 +284,36 @@ void led_main(void)
 
 /**
  * Read the display's 24-bit ID
- * @param[in] buf 3-byte buffer to hold the
+ * @param[in] buf 3-byte buffer to hold the ID
  */
 void read_display_id(uint8_t* buf)
 {
+	//chip_select = 0;
+	SRAM_BANK_ADDR_8BIT(CMD) = (uint8_t) 0x04;	// Write the Read id command out
+	uint8_t dummy = SRAM_BANK_ADDR_8BIT(DATA); 	// Dummy read
+	buf[0] = SRAM_BANK_ADDR_8BIT(DATA);
+	buf[1] = SRAM_BANK_ADDR_8BIT(DATA);
+	buf[2] = SRAM_BANK_ADDR_8BIT(DATA);
+
+	//*buf = SRAM_BANK_ADDR_32BIT(DATA);
+	//chip_select = 1;
+}
+
+uint8_t read_manu_id(void)
+{
+	//chip_select = 0;
+	SRAM_BANK_ADDR_8BIT(CMD) = 0xDA;
 	uint8_t dummy;
-	SRAM_BANK_ADDR(CMD) = (uint8_t) 0x04;	// Write the Read id command out
-	dummy = SRAM_BANK_ADDR(DATA) ;	// Dummy read
-	buf[0] = SRAM_BANK_ADDR(DATA);  // Read out ID1
-	buf[1] = SRAM_BANK_ADDR(DATA);  // Read out ID2
-	buf[2] = SRAM_BANK_ADDR(DATA);  // Read out ID3
+	dummy = SRAM_BANK_ADDR_8BIT(DATA);
+	dummy = SRAM_BANK_ADDR_8BIT(DATA);
+	return dummy;
+}
+
+mbed::Ticker lv_tick;
+
+void tick(void)
+{
+	lv_tick_inc(1);
 }
 
 int main(void) {
@@ -167,27 +350,90 @@ int main(void) {
 	MX_FSMC_Init();
 	/* USER CODE BEGIN 2 */
 
+	chip_select = 0;
+
 	reset = 0;
 	wait_ms(200);
 	reset = 1;
 	wait_ms(300);
 
-	SRAM_BANK_ADDR(CMD) = 0x01; // Soft reset
+	//SRAM_BANK_ADDR_8BIT(CMD) = 0x01; // Soft reset
 
 	uint8_t buf[3];
 	read_display_id(buf);
+
+	//uint8_t buf = read_manu_id();
 	debug("Display ID: 0x%X, 0x%X, 0x%X\r\n", buf[0], buf[1], buf[2]);
 
-	hx8357d_init(&bus);
-	TFT_Fill_Screen(0x7E0);
+	//debug("Display ID: 0x%X\r\n", buf);
 
-	uint8_t* lcd_ptr;
-	lcd_ptr = (uint8_t*) ((uint32_t) 0x60000000);
-	uint8_t i = 0;
+	hx8357d_init(&bus);
+	TFT_Fill_Screen(0xFFFF);
+
+	lv_disp_drv_t disp_drv;
+	lv_init();
+	lv_disp_drv_init(&disp_drv);
+	disp_drv.disp_flush = disp_flush;
+	lv_disp_drv_register(&disp_drv);
+
+    /*************************
+     * Input device interface
+     *************************/
+    /*Add a touchpad in the example*/
+    /*touchpad_init();*/                            /*Initialize your touchpad*/
+//    lv_indev_drv_t indev_drv;                       /*Descriptor of an input device driver*/
+//    lv_indev_drv_init(&indev_drv);                  /*Basic initialization*/
+//    indev_drv.type = LV_INDEV_TYPE_POINTER;         /*The touchpad is pointer type device*/
+//    indev_drv.read = tp_read;                 /*Library ready your touchpad via this function*/
+//    lv_indev_drv_register(&indev_drv);              /*Finally register the driver*/
+
+	lv_tick.attach_us(tick, 1000);
 
 	led_thread.start(led_main);
 
+	//tpcal_create();
+
+	demo_create();
+
+	//lv_tutorial_themes();
+
+	while(true)
+	{
+		lv_task_handler();
+		wait_ms(5);
+	}
+
+	uint16_t color = 0;
+	while(true)
+	{
+		continue;
+		TFT_Fill_Screen(color);
+		color++;
+		wait_ms(10);
+	}
+
+
+	uint16_t colors[] = {0xF800, 0x7E0, 0x1F };
+
+	int i = 0;
+	int j = 0;
 	while (true) {
+
+		if(i >= 3)
+			i = 0;
+
+		if(j < 9)
+		{
+			TFT_Fill_Screen(colors[i]);
+		}
+		else
+		if(j > 9)
+		{
+			TFT_Fillbox(100, 100, 200, 200, colors[i]);
+		}
+
+		i++;
+		j++;
 
 		//debug("Hello World!");
 		wait_ms(500);
@@ -311,11 +557,11 @@ static void MX_FSMC_Init(void) {
 	hsram1.Init.WriteBurst = FSMC_WRITE_BURST_DISABLE;
 	hsram1.Init.PageSize = FSMC_PAGE_SIZE_NONE;
 	/* Timing */
-	Timing.AddressSetupTime = 15; //3; //15;
-	Timing.AddressHoldTime = 15; //15;
-	Timing.DataSetupTime = 15; //255;
+	Timing.AddressSetupTime = 3; //15;
+	Timing.AddressHoldTime = 2;
+	Timing.DataSetupTime = 3;
 	Timing.BusTurnAroundDuration = 0; //15;
-	Timing.CLKDivision = 16;//16;
+	Timing.CLKDivision = 0;//16;
 	Timing.DataLatency = 0; //17;
 	Timing.AccessMode = FSMC_ACCESS_MODE_B;//FSMC_ACCESS_MODE_A;
 	/* ExtTiming */
